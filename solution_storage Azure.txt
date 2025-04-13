@@ -1,0 +1,268 @@
+Question:-
+Managing Billing Records in Azure Serverless Architecture:-
+We have a serverless architecture in Azure, where one of our services stores billing records in Azure Cosmos DB.
+The system is read-heavy, but records older than three months are rarely accessed.
+Over the past few years, the database size has significantly grown, leading to increased costs. 
+We need an efficient way to reduce costs while maintaining data availability.
+Current System Constraints:-
+                      Record Size: Each billing record can be as large as 300 KB.
+                      Total Records: The database currently holds over 2 million records.
+                      Access Latency: When an old record is requested, it should still be served, with a response time in the order of seconds.
+
+Solution Requirements:-
+Please propose a detailed solution to optimize costs while ensuring the following:-Simplicity & Ease of Implementation,
+No Data Loss & No Downtime,The existing read/write APIs for billing records must remain unchanged
+
+Bonus Points:-
+Include an architecture diagram illustrating your proposed solution.
+Provide pseudocode, commands, or scripts for implementing core logic (such as data archival, retrieval, and cost optimization strategies).
+
+
+______________________________________________________********************************************______________________________________________________________________________
+
+Here’s a simple, cost-efficient, and low-maintenance solution for optimizing billing record storage in Azure using a hot/cold data split with no API change, no downtime, and no data loss.
+
+✅ High-Level Solution (3-Step Plan)
+🔹 1. Use Cosmos DB only for recent (≤3 months) billing records.
+🔹 2. Move older records to Azure Blob Storage (Cool tier).
+🔹 3. Update your API’s read logic to fetch from Blob if not found in Cosmos.
+🧱 Architecture Overview
+sql
+Copy
+Edit
+                       +----------------------+
+                       |   Client / Frontend  |
+                       +----------+-----------+
+                                  |
+                                  v
+                       +----------+-----------+
+                       |  Billing API Layer    |
+                       |  (unchanged writes)   |
+                       +----------+-----------+
+                                  |
+                +----------------+------------------+
+                |                                   |
+     +----------v----------+         +--------------v------------+
+     | Cosmos DB (Hot Data) |         | Azure Function Read Proxy |
+     | < 3 months           |         |  Fetches old from Blob    |
+     +----------+----------+         +--------------+------------+
+                |                                   |
+     +----------v----------+            +-----------v------------+
+     | Archival Function   |            | Azure Blob Storage      |
+     | (Timer-based)       |            | (≥3 months cold data)   |
+     +---------------------+            +-------------------------+
+🛠️ Implementation in 3 Simple Steps
+✅ Step 1: Deploy Infra (Manually or IaC)
+Use the Azure Portal to quickly:
+
+Create a Cosmos DB account with TTL disabled.
+
+Create an Azure Storage Account with a container called archived-records (Cool tier).
+
+Create an Azure Function App (Timer-triggered Python or Node.js).
+
+Give it a Managed Identity with access to both Cosmos DB and Blob.
+
+
+
+✅ Step 2: Archival Function (Daily Cleanup)
+Function logic (Python-like pseudocode):
+
+python
+
+def archive_old_records():
+    old_records = cosmos.query("SELECT * FROM c WHERE c.timestamp < now() - 90d")
+    for record in old_records:
+        blob.upload(record.id + '.json', json.dumps(record))
+        cosmos.delete(record.id, partition_key=record['partitionKey'])
+Trigger: Once per day using CRON (0 0 * * *)
+
+Compress records optionally for extra savings
+
+Enable soft-delete for safety in Blob
+
+✅ Step 3: API Read Path Logic
+Update your read method only to:
+
+python
+
+def get_billing_record(id, partition_key):
+    try:
+        return cosmos.read(id, partition_key)
+    except NotFound:
+        return blob.download(id + '.json')
+➡️ No changes to write logic. API remains backward-compatible.
+
+💰 Cost Optimization Strategy
+Tier	       Use Case	           Storage Tier	     Notes
+Cosmos DB	  Hot data (≤90d)	        Standard	Fast reads & indexing
+Blob Storage	Cold data (>90d)	Cool/Archive	80–90% cheaper per GB
+🎯 Benefits Recap
+Requirement	Solution Match ✅
+Simplicity	 Only 1 Azure Function + minor API tweak
+No Downtime	 Cosmos DB untouched during migration
+No Data Loss	Data archived safely before deletion
+Low Cost	 Cold storage & cleanup reduce Cosmos size
+Same API	 Write unchanged, Read auto-fallback logic
+Low Latency	 Blob read in seconds (acceptable fallback)
+
+>>Here is the complete Terraform script to set up:
+Cosmos DB (for recent records)
+Azure Blob Storage (for archived records)
+Azure Function App (Python) for scheduled archival
+Outputs for quick integration
+
+# Terraform script to deploy Cosmos DB, Blob Storage, Azure Function + CI/CD
+
+provider "azurerm" {
+  features {}
+}
+
+variable "location" {
+  default = "eastus"
+}
+
+resource "azurerm_resource_group" "rg" {
+  name     = "billing-rg"
+  location = var.location
+}
+
+resource "azurerm_cosmosdb_account" "cosmos" {
+  name                = "billing-cosmosdb"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+  offer_type          = "Standard"
+  kind                = "GlobalDocumentDB"
+
+  consistency_policy {
+    consistency_level = "Session"
+  }
+
+  geo_location {
+    location          = azurerm_resource_group.rg.location
+    failover_priority = 0
+  }
+}
+
+resource "azurerm_cosmosdb_sql_database" "db" {
+  name                = "billing"
+  resource_group_name = azurerm_resource_group.rg.name
+  account_name        = azurerm_cosmosdb_account.cosmos.name
+}
+
+resource "azurerm_cosmosdb_sql_container" "container" {
+  name                = "records"
+  resource_group_name = azurerm_resource_group.rg.name
+  account_name        = azurerm_cosmosdb_account.cosmos.name
+  database_name       = azurerm_cosmosdb_sql_database.db.name
+  partition_key_path  = "/partitionKey"
+  throughput          = 400
+}
+
+resource "azurerm_storage_account" "storage" {
+  name                     = "billingstorageacct"
+  resource_group_name      = azurerm_resource_group.rg.name
+  location                 = azurerm_resource_group.rg.location
+  account_tier             = "Standard"
+  account_replication_type = "LRS"
+}
+
+resource "azurerm_storage_container" "archive" {
+  name                  = "archived-records"
+  storage_account_name  = azurerm_storage_account.storage.name
+  container_access_type = "private"
+}
+
+resource "azurerm_app_service_plan" "plan" {
+  name                = "billing-asp"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+  kind                = "FunctionApp"
+  reserved            = true
+  sku {
+    tier = "Dynamic"
+    size = "Y1"
+  }
+}
+
+resource "azurerm_function_app" "archiver" {
+  name                       = "billing-archiver"
+  location                   = azurerm_resource_group.rg.location
+  resource_group_name        = azurerm_resource_group.rg.name
+  app_service_plan_id        = azurerm_app_service_plan.plan.id
+  storage_account_name       = azurerm_storage_account.storage.name
+  storage_account_access_key = azurerm_storage_account.storage.primary_access_key
+  os_type                    = "linux"
+  version                    = "~4"
+  functions_extension_version = "~4"
+  runtime_stack              = "python"
+  site_config {
+    application_stack {
+      python_version = "3.10"
+    }
+  }
+  app_settings = {
+    COSMOS_ENDPOINT                  = azurerm_cosmosdb_account.cosmos.endpoint
+    COSMOS_KEY                       = azurerm_cosmosdb_account.cosmos.primary_key
+    COSMOS_DB                        = azurerm_cosmosdb_sql_database.db.name
+    COSMOS_CONTAINER                 = azurerm_cosmosdb_sql_container.container.name
+    AZURE_STORAGE_CONNECTION_STRING  = azurerm_storage_account.storage.primary_connection_string
+    BLOB_CONTAINER                   = azurerm_storage_container.archive.name
+    FUNCTIONS_WORKER_RUNTIME         = "python"
+    WEBSITE_RUN_FROM_PACKAGE         = "1"
+  }
+}
+
+output "function_app_url" {
+  value = azurerm_function_app.archiver.default_hostname
+}
+
+output "cosmosdb_endpoint" {
+  value = azurerm_cosmosdb_account.cosmos.endpoint
+} 
+
+output "blob_container_url" {
+  value = azurerm_storage_account.storage.primary_blob_endpoint
+} 
+
+# GitHub Actions CI/CD workflow (place in .github/workflows/deploy.yml)
+# This assumes Python Function code is in ./function_app/
+
+# --- START OF CI/CD YAML ---
+# name: Deploy Billing Archiver
+#
+# on:
+#   push:
+#     branches: [ main ]
+#
+# jobs:
+#   build-and-deploy:
+#     runs-on: ubuntu-latest
+#     steps:
+#     - uses: actions/checkout@v3
+#
+#     - name: Set up Python
+#       uses: actions/setup-python@v4
+#       with:
+#         python-version: '3.10'
+#
+#     - name: Zip function app
+#       run: |
+#         cd function_app
+#         zip -r ../function.zip .
+#
+#     - name: Azure Login
+#       uses: azure/login@v1
+#       with:
+#         creds: ${{ secrets.AZURE_CREDENTIALS }}
+#
+#     - name: Upload Function Package
+#       uses: azure/webapps-deploy@v2
+#       with:
+#         app-name: billing-archiver
+#         package: function.zip
+# --- END OF CI/CD YAML ---
+
+# 🔐 Save Azure credentials as a GitHub Secret called `AZURE_CREDENTIALS`
+# Generate using:
+# az ad sp create-for-rbac --name "billing-archiver" --sdk-auth
